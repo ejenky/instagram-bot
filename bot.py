@@ -89,8 +89,8 @@ def detect_content_region(video_path):
 
 def detect_text_overlay_region(video_path):
     """
-    Smart detection of text overlay regions (white/gray/black bars with text at top/bottom).
-    Analyzes frame for uniform color bands that likely contain existing text.
+    Smart detection of text overlay regions by comparing edge colors between rows.
+    Text overlays have consistent background colors at the edges across multiple rows.
     Returns crop coordinates to remove these regions.
     """
     import subprocess
@@ -119,12 +119,11 @@ def detect_text_overlay_region(video_path):
     if width == 0 or height == 0:
         return None
 
-    # Extract a frame for analysis (skip first few frames to avoid black intro)
     with tempfile.NamedTemporaryFile(suffix='.ppm', delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
-        # Extract frame as PPM (simple format we can parse)
+        # Extract frame, skip 0.5s to avoid black intro
         subprocess.run([
             'ffmpeg', '-y', '-ss', '0.5', '-i', video_path, '-vframes', '1',
             '-f', 'image2', tmp_path
@@ -133,109 +132,87 @@ def detect_text_overlay_region(video_path):
         if not os.path.exists(tmp_path):
             return None
 
-        # Read PPM file and analyze for uniform bands
         with open(tmp_path, 'rb') as f:
-            # Skip PPM header
-            header = f.readline()  # P6
-            # Skip comments
+            header = f.readline()
             line = f.readline()
             while line.startswith(b'#'):
                 line = f.readline()
-            # Get dimensions
             dims = line.decode().strip().split()
             if len(dims) < 2:
                 return None
             img_w, img_h = int(dims[0]), int(dims[1])
-            f.readline()  # Max value (255)
-
-            # Read pixel data
+            f.readline()
             pixels = f.read()
 
         if len(pixels) < img_w * img_h * 3:
             return None
 
-        def get_row_stats(y_pos):
-            """Get color statistics for a horizontal row"""
+        def get_edge_avg_color(y_pos):
+            """Get average color from left and right edges of a row"""
             start = y_pos * img_w * 3
-            row_pixels = pixels[start:start + img_w * 3]
-            if len(row_pixels) < img_w * 3:
+            row = pixels[start:start + img_w * 3]
+            if len(row) < img_w * 3:
                 return None
 
-            # Sample pixels across the row
-            r_vals, g_vals, b_vals = [], [], []
-            for x in range(0, img_w * 3, 15):  # Every 5 pixels
-                if x + 2 < len(row_pixels):
-                    r_vals.append(row_pixels[x])
-                    g_vals.append(row_pixels[x + 1])
-                    b_vals.append(row_pixels[x + 2])
+            # Sample 30 pixels from each edge
+            colors = []
+            for i in range(30):
+                # Left edge
+                idx = i * 3
+                if idx + 2 < len(row):
+                    colors.append((row[idx], row[idx+1], row[idx+2]))
+                # Right edge
+                idx = (img_w - 1 - i) * 3
+                if idx + 2 < len(row):
+                    colors.append((row[idx], row[idx+1], row[idx+2]))
 
-            if not r_vals:
+            if not colors:
                 return None
 
-            # Calculate variance and average brightness
-            def variance(vals):
-                mean = sum(vals) / len(vals)
-                return sum((v - mean) ** 2 for v in vals) / len(vals)
+            return (
+                sum(c[0] for c in colors) / len(colors),
+                sum(c[1] for c in colors) / len(colors),
+                sum(c[2] for c in colors) / len(colors)
+            )
 
-            avg_brightness = (sum(r_vals) + sum(g_vals) + sum(b_vals)) / (3 * len(r_vals))
-            total_var = variance(r_vals) + variance(g_vals) + variance(b_vals)
-
-            return {'variance': total_var, 'brightness': avg_brightness}
-
-        def is_text_overlay_row(stats):
-            """Check if row looks like a text overlay background"""
-            if stats is None:
+        def colors_similar(c1, c2, threshold=45):
+            """Check if two colors are similar"""
+            if not c1 or not c2:
                 return False
-            # Text overlays typically have low variance (solid color)
-            # and are either very bright (white) or very dark (black)
-            is_low_variance = stats['variance'] < 800
-            is_extreme_brightness = stats['brightness'] > 200 or stats['brightness'] < 50
-            return is_low_variance and is_extreme_brightness
+            return all(abs(c1[i] - c2[i]) < threshold for i in range(3))
 
-        def is_video_content_row(stats):
-            """Check if row looks like actual video content"""
-            if stats is None:
-                return True  # Assume content if can't read
-            # Video content has higher variance (detail/texture)
-            # Threshold is higher to be more aggressive about finding content
-            return stats['variance'] > 1500
+        # Get reference color from very top
+        ref_top_color = get_edge_avg_color(5)
 
-        # Find where video content starts from top
+        # Find where top text overlay ends
         top_crop = 0
-        consecutive_content_rows = 0
-
-        for y in range(0, min(img_h // 2, 600)):  # Check top half, max 600px
-            stats = get_row_stats(y)
-            if is_video_content_row(stats):
-                consecutive_content_rows += 1
-                if consecutive_content_rows >= 10:  # Need 10 consecutive rows of content
-                    top_crop = max(0, y - 15)  # Go back a bit
+        if ref_top_color:
+            for y in range(10, min(img_h // 2, 800)):
+                curr_color = get_edge_avg_color(y)
+                if not colors_similar(ref_top_color, curr_color):
+                    top_crop = y
                     break
-            else:
-                consecutive_content_rows = 0
 
-        # Find where video content ends at bottom
+        # Get reference color from very bottom
+        ref_bottom_color = get_edge_avg_color(img_h - 5)
+
+        # Find where bottom text overlay starts
         bottom_crop = img_h
-        consecutive_content_rows = 0
-
-        for y in range(img_h - 1, max(img_h // 2, img_h - 600), -1):
-            stats = get_row_stats(y)
-            if is_video_content_row(stats):
-                consecutive_content_rows += 1
-                if consecutive_content_rows >= 10:  # Need 10 consecutive rows of content
-                    bottom_crop = min(img_h, y + 15)  # Go forward a bit
+        if ref_bottom_color:
+            for y in range(img_h - 10, max(img_h // 2, 200), -1):
+                curr_color = get_edge_avg_color(y)
+                if not colors_similar(ref_bottom_color, curr_color):
+                    bottom_crop = y
                     break
-            else:
-                consecutive_content_rows = 0
 
-        # Only return if we found significant regions to crop (at least 3% on either side)
+        content_height = bottom_crop - top_crop
         top_percent = top_crop / img_h
         bottom_percent = (img_h - bottom_crop) / img_h
-        content_height = bottom_crop - top_crop
 
-        if (top_percent > 0.03 or bottom_percent > 0.03) and content_height > img_h * 0.3:
-            # Scale to original video dimensions
+        # Crop if we found overlay regions (>2% of frame)
+        if (top_percent > 0.02 or bottom_percent > 0.02) and content_height > img_h * 0.3:
             scale_y = height / img_h
+            logger.info(f"Smart crop: top={top_crop}px ({top_percent*100:.1f}%), bottom={img_h-bottom_crop}px ({bottom_percent*100:.1f}%)")
             return {
                 'w': width,
                 'h': int(content_height * scale_y),
@@ -253,7 +230,6 @@ def detect_text_overlay_region(video_path):
         logger.warning(f"Text overlay detection failed: {e}")
         return None
     finally:
-        # Clean up temp file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
