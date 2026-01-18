@@ -89,7 +89,7 @@ def detect_content_region(video_path):
 
 def detect_text_overlay_region(video_path):
     """
-    Smart detection of text overlay regions (white/gray bars with text at top/bottom).
+    Smart detection of text overlay regions (white/gray/black bars with text at top/bottom).
     Analyzes frame for uniform color bands that likely contain existing text.
     Returns crop coordinates to remove these regions.
     """
@@ -119,14 +119,14 @@ def detect_text_overlay_region(video_path):
     if width == 0 or height == 0:
         return None
 
-    # Extract a frame for analysis
+    # Extract a frame for analysis (skip first few frames to avoid black intro)
     with tempfile.NamedTemporaryFile(suffix='.ppm', delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
         # Extract frame as PPM (simple format we can parse)
         subprocess.run([
-            'ffmpeg', '-y', '-i', video_path, '-vframes', '1',
+            'ffmpeg', '-y', '-ss', '0.5', '-i', video_path, '-vframes', '1',
             '-f', 'image2', tmp_path
         ], capture_output=True, timeout=30)
 
@@ -154,62 +154,88 @@ def detect_text_overlay_region(video_path):
         if len(pixels) < img_w * img_h * 3:
             return None
 
-        # Analyze horizontal slices for uniformity
-        # A uniform slice (low variance) likely contains text overlay
-        def analyze_row(y_pos):
-            """Calculate color variance for a horizontal row"""
+        def get_row_stats(y_pos):
+            """Get color statistics for a horizontal row"""
             start = y_pos * img_w * 3
-            end = start + img_w * 3
-            row_pixels = pixels[start:end]
+            row_pixels = pixels[start:start + img_w * 3]
             if len(row_pixels) < img_w * 3:
-                return 999  # High variance if can't read
+                return None
 
-            # Sample every 10th pixel for speed
+            # Sample pixels across the row
             r_vals, g_vals, b_vals = [], [], []
-            for x in range(0, img_w * 3, 30):  # Every 10 pixels
+            for x in range(0, img_w * 3, 15):  # Every 5 pixels
                 if x + 2 < len(row_pixels):
                     r_vals.append(row_pixels[x])
                     g_vals.append(row_pixels[x + 1])
                     b_vals.append(row_pixels[x + 2])
 
             if not r_vals:
-                return 999
+                return None
 
-            # Calculate variance
+            # Calculate variance and average brightness
             def variance(vals):
                 mean = sum(vals) / len(vals)
                 return sum((v - mean) ** 2 for v in vals) / len(vals)
 
-            return variance(r_vals) + variance(g_vals) + variance(b_vals)
+            avg_brightness = (sum(r_vals) + sum(g_vals) + sum(b_vals)) / (3 * len(r_vals))
+            total_var = variance(r_vals) + variance(g_vals) + variance(b_vals)
 
-        # Find where content starts from top (skip uniform text areas)
-        variance_threshold = 500  # Low variance = uniform color (text overlay)
+            return {'variance': total_var, 'brightness': avg_brightness}
+
+        def is_text_overlay_row(stats):
+            """Check if row looks like a text overlay background"""
+            if stats is None:
+                return False
+            # Text overlays typically have low variance (solid color)
+            # and are either very bright (white) or very dark (black)
+            is_low_variance = stats['variance'] < 800
+            is_extreme_brightness = stats['brightness'] > 200 or stats['brightness'] < 50
+            return is_low_variance and is_extreme_brightness
+
+        def is_video_content_row(stats):
+            """Check if row looks like actual video content"""
+            if stats is None:
+                return True  # Assume content if can't read
+            # Video content has higher variance (detail/texture)
+            # Threshold is higher to be more aggressive about finding content
+            return stats['variance'] > 1500
+
+        # Find where video content starts from top
         top_crop = 0
+        consecutive_content_rows = 0
 
-        # Check top region
-        for y in range(0, min(img_h // 3, 400)):  # Check top third, max 400px
-            var = analyze_row(y)
-            if var > variance_threshold:
-                # Found non-uniform row - this is content
-                # Go back a bit to be safe
-                top_crop = max(0, y - 5)
-                break
+        for y in range(0, min(img_h // 2, 600)):  # Check top half, max 600px
+            stats = get_row_stats(y)
+            if is_video_content_row(stats):
+                consecutive_content_rows += 1
+                if consecutive_content_rows >= 10:  # Need 10 consecutive rows of content
+                    top_crop = max(0, y - 15)  # Go back a bit
+                    break
+            else:
+                consecutive_content_rows = 0
 
-        # Find where content ends at bottom
+        # Find where video content ends at bottom
         bottom_crop = img_h
-        for y in range(img_h - 1, max(img_h * 2 // 3, img_h - 400), -1):
-            var = analyze_row(y)
-            if var > variance_threshold:
-                # Found non-uniform row - this is content
-                bottom_crop = min(img_h, y + 5)
-                break
+        consecutive_content_rows = 0
 
-        # Only return if we actually found text regions to crop (at least 5% removed)
+        for y in range(img_h - 1, max(img_h // 2, img_h - 600), -1):
+            stats = get_row_stats(y)
+            if is_video_content_row(stats):
+                consecutive_content_rows += 1
+                if consecutive_content_rows >= 10:  # Need 10 consecutive rows of content
+                    bottom_crop = min(img_h, y + 15)  # Go forward a bit
+                    break
+            else:
+                consecutive_content_rows = 0
+
+        # Only return if we found significant regions to crop (at least 3% on either side)
+        top_percent = top_crop / img_h
+        bottom_percent = (img_h - bottom_crop) / img_h
         content_height = bottom_crop - top_crop
-        if content_height < img_h * 0.95 and content_height > img_h * 0.3:
-            # Scale to original video dimensions if frame was scaled
+
+        if (top_percent > 0.03 or bottom_percent > 0.03) and content_height > img_h * 0.3:
+            # Scale to original video dimensions
             scale_y = height / img_h
-            scale_x = width / img_w
             return {
                 'w': width,
                 'h': int(content_height * scale_y),
