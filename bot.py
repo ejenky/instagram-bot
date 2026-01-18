@@ -296,11 +296,31 @@ class MediaProcessor:
     async def download_video(self, url: str) -> str:
         rand = self._random_str()
         output_template = os.path.join(self.temp_dir, f'input_{rand}.%(ext)s')
-        cmd = ['yt-dlp', '--no-warnings', '-f', 'best[ext=mp4]/best', '--merge-output-format', 'mp4', '-o', output_template, '--no-playlist', '--no-check-certificates', url]
+
+        # Enhanced yt-dlp options for better compatibility with X/Twitter
+        cmd = [
+            'yt-dlp',
+            '--no-warnings',
+            '-f', 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
+            '--merge-output-format', 'mp4',
+            '-o', output_template,
+            '--no-playlist',
+            '--no-check-certificates',
+            '--retries', '3',
+            '--fragment-retries', '3',
+            '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            '--extractor-args', 'twitter:api=syndication',
+            url
+        ]
+
         process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await process.communicate()
+
         if process.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            logger.error(f"yt-dlp failed: {error_msg}")
             raise Exception(f"Download failed. Check the link is valid and public.")
+
         for f in os.listdir(self.temp_dir):
             if f.startswith(f'input_{rand}'):
                 return os.path.join(self.temp_dir, f)
