@@ -44,16 +44,16 @@ REEL_HEIGHT = 1920
 
 
 def detect_content_region(video_path):
-    """Detect actual video content area, excluding text bars"""
+    """Detect actual video content area, excluding text bars and overlays"""
     import subprocess
     import json
-    
+
     # Get video dimensions
     probe = subprocess.run([
         'ffprobe', '-v', 'quiet', '-print_format', 'json',
         '-show_streams', video_path
     ], capture_output=True, text=True)
-    
+
     try:
         data = json.loads(probe.stdout)
         for stream in data.get('streams', []):
@@ -65,16 +65,16 @@ def detect_content_region(video_path):
             return None
     except:
         return None
-    
+
     if width == 0 or height == 0:
         return None
-    
-    # Use ffmpeg cropdetect to find content area
+
+    # Use ffmpeg cropdetect to find content area (handles black bars)
     result = subprocess.run([
         'ffmpeg', '-i', video_path, '-vframes', '30', '-vf',
         'cropdetect=24:16:0', '-f', 'null', '-'
     ], capture_output=True, text=True, timeout=30)
-    
+
     # Parse cropdetect output for most common crop value
     crop_lines = re.findall(r'crop=(\d+):(\d+):(\d+):(\d+)', result.stderr)
     if crop_lines:
@@ -83,8 +83,153 @@ def detect_content_region(video_path):
         # Only return crop if it's significantly different (>5% cropped)
         if h < height * 0.95 or w < width * 0.95:
             return {'w': w, 'h': h, 'x': x, 'y': y, 'orig_w': width, 'orig_h': height}
-    
+
     return None
+
+
+def detect_text_overlay_region(video_path):
+    """
+    Smart detection of text overlay regions (white/gray bars with text at top/bottom).
+    Analyzes frame for uniform color bands that likely contain existing text.
+    Returns crop coordinates to remove these regions.
+    """
+    import subprocess
+    import json
+    import tempfile
+    import os
+
+    # Get video dimensions
+    probe = subprocess.run([
+        'ffprobe', '-v', 'quiet', '-print_format', 'json',
+        '-show_streams', video_path
+    ], capture_output=True, text=True)
+
+    try:
+        data = json.loads(probe.stdout)
+        for stream in data.get('streams', []):
+            if stream.get('codec_type') == 'video':
+                width = stream.get('width', 0)
+                height = stream.get('height', 0)
+                break
+        else:
+            return None
+    except:
+        return None
+
+    if width == 0 or height == 0:
+        return None
+
+    # Extract a frame for analysis
+    with tempfile.NamedTemporaryFile(suffix='.ppm', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # Extract frame as PPM (simple format we can parse)
+        subprocess.run([
+            'ffmpeg', '-y', '-i', video_path, '-vframes', '1',
+            '-f', 'image2', tmp_path
+        ], capture_output=True, timeout=30)
+
+        if not os.path.exists(tmp_path):
+            return None
+
+        # Read PPM file and analyze for uniform bands
+        with open(tmp_path, 'rb') as f:
+            # Skip PPM header
+            header = f.readline()  # P6
+            # Skip comments
+            line = f.readline()
+            while line.startswith(b'#'):
+                line = f.readline()
+            # Get dimensions
+            dims = line.decode().strip().split()
+            if len(dims) < 2:
+                return None
+            img_w, img_h = int(dims[0]), int(dims[1])
+            f.readline()  # Max value (255)
+
+            # Read pixel data
+            pixels = f.read()
+
+        if len(pixels) < img_w * img_h * 3:
+            return None
+
+        # Analyze horizontal slices for uniformity
+        # A uniform slice (low variance) likely contains text overlay
+        def analyze_row(y_pos):
+            """Calculate color variance for a horizontal row"""
+            start = y_pos * img_w * 3
+            end = start + img_w * 3
+            row_pixels = pixels[start:end]
+            if len(row_pixels) < img_w * 3:
+                return 999  # High variance if can't read
+
+            # Sample every 10th pixel for speed
+            r_vals, g_vals, b_vals = [], [], []
+            for x in range(0, img_w * 3, 30):  # Every 10 pixels
+                if x + 2 < len(row_pixels):
+                    r_vals.append(row_pixels[x])
+                    g_vals.append(row_pixels[x + 1])
+                    b_vals.append(row_pixels[x + 2])
+
+            if not r_vals:
+                return 999
+
+            # Calculate variance
+            def variance(vals):
+                mean = sum(vals) / len(vals)
+                return sum((v - mean) ** 2 for v in vals) / len(vals)
+
+            return variance(r_vals) + variance(g_vals) + variance(b_vals)
+
+        # Find where content starts from top (skip uniform text areas)
+        variance_threshold = 500  # Low variance = uniform color (text overlay)
+        top_crop = 0
+
+        # Check top region
+        for y in range(0, min(img_h // 3, 400)):  # Check top third, max 400px
+            var = analyze_row(y)
+            if var > variance_threshold:
+                # Found non-uniform row - this is content
+                # Go back a bit to be safe
+                top_crop = max(0, y - 5)
+                break
+
+        # Find where content ends at bottom
+        bottom_crop = img_h
+        for y in range(img_h - 1, max(img_h * 2 // 3, img_h - 400), -1):
+            var = analyze_row(y)
+            if var > variance_threshold:
+                # Found non-uniform row - this is content
+                bottom_crop = min(img_h, y + 5)
+                break
+
+        # Only return if we actually found text regions to crop (at least 5% removed)
+        content_height = bottom_crop - top_crop
+        if content_height < img_h * 0.95 and content_height > img_h * 0.3:
+            # Scale to original video dimensions if frame was scaled
+            scale_y = height / img_h
+            scale_x = width / img_w
+            return {
+                'w': width,
+                'h': int(content_height * scale_y),
+                'x': 0,
+                'y': int(top_crop * scale_y),
+                'orig_w': width,
+                'orig_h': height,
+                'top_crop': int(top_crop * scale_y),
+                'bottom_crop': int((img_h - bottom_crop) * scale_y)
+            }
+
+        return None
+
+    except Exception as e:
+        logger.warning(f"Text overlay detection failed: {e}")
+        return None
+    finally:
+        # Clean up temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 class PresetManager:
@@ -196,46 +341,67 @@ class MediaProcessor:
             parts.append(f"curves=m='0/{bp/255:.3f} 1/1'")
         return ','.join(parts) if parts else None
     
-    async def process_video(self, input_path: str, output_path: str, crop_mode: str = 'smart', 
-                           top_text: Optional[str] = None, watermark_text: Optional[str] = None, 
+    async def process_video(self, input_path: str, output_path: str, crop_mode: str = 'smart',
+                           top_text: Optional[str] = None, watermark_text: Optional[str] = None,
                            watermark_image: Optional[str] = None, dark_mode: bool = True) -> str:
         info = self.get_media_info(input_path)
         src_w, src_h = info['width'], info['height']
         if src_w == 0 or src_h == 0:
             raise Exception("Could not read video dimensions")
-        
+
+        # Smart crop: detect existing text overlays and crop them out
+        text_region = None
+        if crop_mode == 'smart':
+            text_region = detect_text_overlay_region(input_path)
+            if text_region:
+                logger.info(f"Detected text overlay region: top={text_region.get('top_crop', 0)}px, bottom={text_region.get('bottom_crop', 0)}px")
+                # Update source dimensions to the cropped region
+                src_w = text_region['w']
+                src_h = text_region['h']
+
         # Layout settings - VIRAL STYLE like @clips, @lmaoys
         bg_color = "black" if dark_mode else "white"
         text_color = "white" if dark_mode else "black"
         shadow_color = "black@0.6" if dark_mode else "white@0.0"
-        
+
         # Text settings - BIG and BOLD
         text_font_size = 60
         text_y_position = 220  # Higher up for multi-line text
-        
+
         # Video area - starts after text, takes most of the screen
         video_top_margin = 480 if top_text else 150
         video_bottom_margin = 100
         content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
         content_width = REEL_WIDTH - 60  # Small side margins
-        
+
         # Watermark settings - INSIDE video area, corner
         wm_font_size = 36
         wm_margin = 25
         wm_opacity = 0.9
-        
+
         filter_parts = []
-        
+
+        # Build initial video filter chain
+        # First, apply smart crop to remove text overlays if detected
+        if text_region:
+            # Crop out the text overlay regions first
+            precrop = f"crop={text_region['w']}:{text_region['h']}:{text_region['x']}:{text_region['y']}"
+            input_label = f"[0:v]{precrop}[precropped]"
+            filter_parts.append(input_label)
+            video_input = "[precropped]"
+        else:
+            video_input = "[0:v]"
+
         # Scale and crop video
         src_aspect = src_w / src_h
         target_aspect = content_width / content_height
-        
+
         if crop_mode == 'fit':
             if src_aspect > target_aspect:
                 scale_filter = f"scale={content_width}:-2"
             else:
                 scale_filter = f"scale=-2:{content_height}"
-            filter_parts.append(f"[0:v]{scale_filter},setsar=1[scaled]")
+            filter_parts.append(f"{video_input}{scale_filter},setsar=1[scaled]")
         else:
             if src_aspect > target_aspect:
                 scale_h = content_height
@@ -250,7 +416,7 @@ class MediaProcessor:
                 crop_y = scale_h - content_height
             else:
                 crop_y = (scale_h - content_height) // 2
-            filter_parts.append(f"[0:v]scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y},setsar=1[scaled]")
+            filter_parts.append(f"{video_input}scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y},setsar=1[scaled]")
         
         # Background
         filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}:d=1,format=yuv420p[bg]")
@@ -282,19 +448,19 @@ class MediaProcessor:
                 text_lines.append(current_line)
             
             # Dynamic font size based on text length
-        total_chars = len(clean_text)
-        if total_chars <= 30:
-            text_font_size = 72  # Big for short text
-        elif total_chars <= 60:
-            text_font_size = 62  # Medium
-        elif total_chars <= 100:
-            text_font_size = 52  # Smaller
-        else:
-            text_font_size = 44  # Smallest for long text
-        
-        line_height = int(text_font_size * 1.35)
-        start_y = 160
-            
+            total_chars = len(clean_text)
+            if total_chars <= 30:
+                text_font_size = 72  # Big for short text
+            elif total_chars <= 60:
+                text_font_size = 62  # Medium
+            elif total_chars <= 100:
+                text_font_size = 52  # Smaller
+            else:
+                text_font_size = 44  # Smallest for long text
+
+            line_height = int(text_font_size * 1.35)
+            start_y = 160
+
             for i, line in enumerate(text_lines):
                 escaped_line = line.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
                 line_y = start_y + (i * line_height)
