@@ -345,7 +345,8 @@ class MediaProcessor:
     
     async def process_video(self, input_path: str, output_path: str, crop_mode: str = 'smart',
                            top_text: Optional[str] = None, watermark_text: Optional[str] = None,
-                           watermark_image: Optional[str] = None, dark_mode: bool = True) -> str:
+                           watermark_image: Optional[str] = None, dark_mode: bool = True,
+                           filter_preset: Optional[str] = None) -> str:
         info = self.get_media_info(input_path)
         src_w, src_h = info['width'], info['height']
         if src_w == 0 or src_h == 0:
@@ -361,32 +362,15 @@ class MediaProcessor:
                 src_w = text_region['w']
                 src_h = text_region['h']
 
-        # Layout settings - VIRAL STYLE like @clips, @lmaoys
+        # Layout settings - VIRAL STYLE like @clips
         bg_color = "black" if dark_mode else "white"
         text_color = "white" if dark_mode else "black"
-        shadow_color = "black@0.6" if dark_mode else "white@0.0"
-
-        # Text settings - BIG and BOLD
-        text_font_size = 60
-        text_y_position = 220  # Higher up for multi-line text
-
-        # Video area - starts after text, takes most of the screen
-        video_top_margin = 480 if top_text else 150
-        video_bottom_margin = 100
-        content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
-        content_width = REEL_WIDTH - 60  # Small side margins
-
-        # Watermark settings - INSIDE video area, corner
-        wm_font_size = 36
-        wm_margin = 25
-        wm_opacity = 0.9
 
         filter_parts = []
 
         # Build initial video filter chain
         # First, apply smart crop to remove text overlays if detected
         if text_region:
-            # Crop out the text overlay regions first
             precrop = f"crop={text_region['w']}:{text_region['h']}:{text_region['x']}:{text_region['y']}"
             input_label = f"[0:v]{precrop}[precropped]"
             filter_parts.append(input_label)
@@ -394,53 +378,46 @@ class MediaProcessor:
         else:
             video_input = "[0:v]"
 
-        # Scale and crop video
-        src_aspect = src_w / src_h
-        target_aspect = content_width / content_height
+        # Apply video filter if specified
+        filter_eq = None
+        if filter_preset and filter_preset != 'none':
+            preset = self.preset_manager.get_preset(filter_preset)
+            if preset:
+                filter_eq = self._build_filter_eq(preset.get('filters', {}))
 
-        if crop_mode == 'fit':
-            if src_aspect > target_aspect:
-                scale_filter = f"scale={content_width}:-2"
-            else:
-                scale_filter = f"scale=-2:{content_height}"
-            filter_parts.append(f"{video_input}{scale_filter},setsar=1[scaled]")
-        else:
-            if src_aspect > target_aspect:
-                scale_h = content_height
-                scale_w = int(src_w * (content_height / src_h))
-            else:
-                scale_w = content_width
-                scale_h = int(src_h * (content_width / src_w))
-            crop_x = (scale_w - content_width) // 2
-            if crop_mode == 'top':
-                crop_y = 0
-            elif crop_mode == 'bottom':
-                crop_y = scale_h - content_height
-            else:
-                crop_y = (scale_h - content_height) // 2
-            filter_parts.append(f"{video_input}scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y},setsar=1[scaled]")
-        
-        # Background
-        filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}:d=1,format=yuv420p[bg]")
-        
-        # Overlay video centered
-        overlay_x = (REEL_WIDTH - content_width) // 2
-        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{video_top_margin}:shortest=0[canvas]")
-        
-        current = "[canvas]"
-        
-        # Add top text - VIRAL STYLE with multi-line support
+        # Calculate text area dynamically
+        text_area_height = 0
+        text_lines = []
+        text_font_size = 58
+        line_height = 78
+
         if top_text:
-            # Clean text: ONLY allow basic printable ASCII
+            # Clean text
             clean_text = ''.join(c if (32 <= ord(c) <= 126) else ' ' for c in top_text)
             clean_text = re.sub(r' {2,}', ' ', clean_text).strip()
-            
-            # Word wrap to fit frame (max ~24 chars per line for font size 60)
+
+            # Dynamic font size - @clips style (slightly smaller, cleaner)
+            total_chars = len(clean_text)
+            if total_chars <= 40:
+                text_font_size = 58
+                max_chars_per_line = 22
+            elif total_chars <= 80:
+                text_font_size = 50
+                max_chars_per_line = 26
+            elif total_chars <= 120:
+                text_font_size = 44
+                max_chars_per_line = 30
+            else:
+                text_font_size = 38
+                max_chars_per_line = 34
+
+            line_height = int(text_font_size * 1.4)
+
+            # Word wrap
             words = clean_text.split()
-            text_lines = []
             current_line = ""
             for word in words:
-                if len(current_line + " " + word) <= 24:
+                if len(current_line + " " + word) <= max_chars_per_line:
                     current_line = (current_line + " " + word).strip()
                 else:
                     if current_line:
@@ -448,20 +425,76 @@ class MediaProcessor:
                     current_line = word
             if current_line:
                 text_lines.append(current_line)
-            
-            # Dynamic font size based on text length
-            total_chars = len(clean_text)
-            if total_chars <= 30:
-                text_font_size = 72  # Big for short text
-            elif total_chars <= 60:
-                text_font_size = 62  # Medium
-            elif total_chars <= 100:
-                text_font_size = 52  # Smaller
-            else:
-                text_font_size = 44  # Smallest for long text
 
-            line_height = int(text_font_size * 1.35)
-            start_y = 160
+            # Calculate text area: lines * line_height + padding
+            text_area_height = len(text_lines) * line_height + 80  # 40px top + 40px bottom padding
+
+        # Video positioning - @clips style: text close to video
+        video_top_margin = text_area_height + 30 if top_text else 80
+        video_bottom_margin = 80
+        content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
+        content_width = REEL_WIDTH - 40  # Minimal side margins
+
+        # Scale video - ALWAYS use FIT mode when smart crop is applied to preserve content
+        src_aspect = src_w / src_h
+        target_aspect = content_width / content_height
+
+        use_fit_mode = (crop_mode == 'fit') or (text_region is not None)
+
+        if use_fit_mode:
+            # Fit mode: show entire video, may have black bars on sides
+            if src_aspect > target_aspect:
+                # Video is wider - fit to width
+                scaled_w = content_width
+                scaled_h = int(content_width / src_aspect)
+            else:
+                # Video is taller - fit to height
+                scaled_h = content_height
+                scaled_w = int(content_height * src_aspect)
+            # Ensure even dimensions
+            scaled_w = scaled_w if scaled_w % 2 == 0 else scaled_w - 1
+            scaled_h = scaled_h if scaled_h % 2 == 0 else scaled_h - 1
+            scale_filter = f"scale={scaled_w}:{scaled_h}"
+        else:
+            # Crop mode: fill frame, crop excess
+            if src_aspect > target_aspect:
+                scale_h = content_height
+                scale_w = int(src_w * (content_height / src_h))
+            else:
+                scale_w = content_width
+                scale_h = int(src_h * (content_width / src_w))
+            scale_w = scale_w if scale_w % 2 == 0 else scale_w - 1
+            scale_h = scale_h if scale_h % 2 == 0 else scale_h - 1
+            crop_x = (scale_w - content_width) // 2
+            if crop_mode == 'top':
+                crop_y = 0
+            elif crop_mode == 'bottom':
+                crop_y = scale_h - content_height
+            else:
+                crop_y = (scale_h - content_height) // 2
+            scale_filter = f"scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y}"
+            scaled_w = content_width
+            scaled_h = content_height
+
+        # Build video filter chain
+        video_filters = scale_filter
+        if filter_eq:
+            video_filters = f"{filter_eq},{video_filters}"
+        filter_parts.append(f"{video_input}{video_filters},setsar=1[scaled]")
+
+        # Background
+        filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}:d=1,format=yuv420p[bg]")
+
+        # Center video horizontally and vertically in its area
+        overlay_x = (REEL_WIDTH - scaled_w) // 2
+        overlay_y = video_top_margin + (content_height - scaled_h) // 2
+        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{overlay_y}:shortest=0[canvas]")
+
+        current = "[canvas]"
+
+        # Add text - @clips style
+        if top_text and text_lines:
+            start_y = 40  # Start 40px from top
 
             for i, line in enumerate(text_lines):
                 escaped_line = line.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
@@ -470,59 +503,59 @@ class MediaProcessor:
                 filter_parts.append(
                     f"{current}drawtext="
                     f"text='{escaped_line}':"
-                    f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                    f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
                     f"fontsize={text_font_size}:"
                     f"fontcolor={text_color}:"
                     f"x=(w-text_w)/2:"
-                    f"y={line_y}:"
-                    f"shadowcolor={shadow_color}:"
-                    f"shadowx=2:shadowy=2"
+                    f"y={line_y}"
                     f"{out_label}"
                 )
                 current = out_label
-            
-            # Alias final text label as [texted] for watermark code
-            if text_lines:
-                filter_parts.append(f"{current}null[texted]")
-                current = "[texted]"
-        
-        # Add watermark - INSIDE video area, top-right or top-left corner
+
+            filter_parts.append(f"{current}null[texted]")
+            current = "[texted]"
+
+        # Watermark settings
+        wm_font_size = 32
+        wm_margin = 20
+        wm_opacity = 0.85
+
+        # Add watermark - inside video area
         if watermark_text:
             escaped_wm = watermark_text.replace("'", "'\\''").replace(":", "\\:")
-            # Position watermark inside video area (top-right corner of video)
-            wm_x = REEL_WIDTH - wm_margin - 10  # Right side
-            wm_y = video_top_margin + wm_margin  # Just inside video top
+            wm_y = overlay_y + 15
             filter_parts.append(
                 f"{current}drawtext="
                 f"text='{escaped_wm}':"
-                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
                 f"fontsize={wm_font_size}:"
                 f"fontcolor=white@{wm_opacity}:"
                 f"x=w-tw-{wm_margin}:"
                 f"y={wm_y}:"
                 f"shadowcolor=black@0.5:"
-                f"shadowx=2:shadowy=2"
+                f"shadowx=1:shadowy=1"
                 f"[final]"
             )
         elif watermark_image and os.path.exists(watermark_image):
-            filter_parts.append(f"[1:v]scale=120:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
-            wm_y = video_top_margin + wm_margin
+            filter_parts.append(f"[1:v]scale=100:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
+            wm_y = overlay_y + 15
             filter_parts.append(f"{current}[wm]overlay=W-w-{wm_margin}:{wm_y}[final]")
         else:
             filter_parts.append(f"{current}null[final]")
-        
+
         filter_complex = ';'.join(filter_parts)
-        
+
         # Determine if we need watermark image input
         wm_input = []
         if watermark_image and os.path.exists(watermark_image) and not watermark_text:
             wm_input = ['-i', watermark_image]
-        
+
+        # Build ffmpeg command with better quality settings
         cmd = ['ffmpeg', '-y', '-i', input_path, *wm_input, '-filter_complex', filter_complex, '-map', '[final]']
         if info.get('has_audio'):
-            cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
+            cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '192k'])
         cmd.extend([
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
             '-pix_fmt', 'yuv420p', '-aspect', '9:16', '-movflags', '+faststart',
             '-map_metadata', '-1',
             '-metadata', f'creation_time={datetime.utcnow().isoformat()}Z',
@@ -547,97 +580,138 @@ class MediaProcessor:
         src_w, src_h = info['width'], info['height']
         if src_w == 0 or src_h == 0:
             raise Exception("Could not read image dimensions")
-        
-        # Same layout as video
+
+        # Layout settings - @clips style
         bg_color = "black" if dark_mode else "white"
         text_color = "white" if dark_mode else "black"
-        shadow_color = "black@0.6" if dark_mode else "white@0.0"
-        
-        text_font_size = 60
-        text_y_position = 220
-        
-        video_top_margin = 480 if top_text else 150
-        video_bottom_margin = 100
-        content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
-        content_width = REEL_WIDTH - 60
-        
-        wm_font_size = 36
-        wm_margin = 25
-        wm_opacity = 0.9
-        
+
         filter_parts = []
-        
+
         # Apply filter preset if specified
-        preset_filter = None
+        filter_eq = None
         if filter_preset and filter_preset != 'none':
             preset = self.preset_manager.get_preset(filter_preset)
             if preset:
-                preset_filter = self._build_filter_eq(preset.get('filters', {}))
-        
+                filter_eq = self._build_filter_eq(preset.get('filters', {}))
+
+        # Calculate text area dynamically
+        text_area_height = 0
+        text_lines = []
+        text_font_size = 58
+        line_height = 78
+
+        if top_text:
+            clean_text = ''.join(c if (32 <= ord(c) <= 126) else ' ' for c in top_text)
+            clean_text = re.sub(r' {2,}', ' ', clean_text).strip()
+
+            total_chars = len(clean_text)
+            if total_chars <= 40:
+                text_font_size = 58
+                max_chars_per_line = 22
+            elif total_chars <= 80:
+                text_font_size = 50
+                max_chars_per_line = 26
+            elif total_chars <= 120:
+                text_font_size = 44
+                max_chars_per_line = 30
+            else:
+                text_font_size = 38
+                max_chars_per_line = 34
+
+            line_height = int(text_font_size * 1.4)
+
+            words = clean_text.split()
+            current_line = ""
+            for word in words:
+                if len(current_line + " " + word) <= max_chars_per_line:
+                    current_line = (current_line + " " + word).strip()
+                else:
+                    if current_line:
+                        text_lines.append(current_line)
+                    current_line = word
+            if current_line:
+                text_lines.append(current_line)
+
+            text_area_height = len(text_lines) * line_height + 80
+
+        # Image positioning
+        image_top_margin = text_area_height + 30 if top_text else 80
+        image_bottom_margin = 80
+        content_height = REEL_HEIGHT - image_top_margin - image_bottom_margin
+        content_width = REEL_WIDTH - 40
+
         src_aspect = src_w / src_h
         target_aspect = content_width / content_height
-        
-        if crop_mode == 'fit':
-            if src_aspect > target_aspect:
-                scale = f"scale={content_width}:-1"
-            else:
-                scale = f"scale=-1:{content_height}"
-            chain = f"{preset_filter},{scale}" if preset_filter else scale
-            filter_parts.append(f"[0:v]{chain},setsar=1[scaled]")
+
+        # Always use fit mode for images to preserve content
+        if src_aspect > target_aspect:
+            scaled_w = content_width
+            scaled_h = int(content_width / src_aspect)
         else:
-            if src_aspect > target_aspect:
-                scale_h = content_height
-                scale_w = int(src_w * (content_height / src_h))
-            else:
-                scale_w = content_width
-                scale_h = int(src_h * (content_width / src_w))
-            crop_x = (scale_w - content_width) // 2
-            crop_y = 0 if crop_mode == 'top' else (scale_h - content_height if crop_mode == 'bottom' else (scale_h - content_height) // 2)
-            chain = f"scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y}"
-            if preset_filter:
-                chain = f"{preset_filter},{chain}"
-            filter_parts.append(f"[0:v]{chain},setsar=1[scaled]")
-        
+            scaled_h = content_height
+            scaled_w = int(content_height * src_aspect)
+        scaled_w = scaled_w if scaled_w % 2 == 0 else scaled_w - 1
+        scaled_h = scaled_h if scaled_h % 2 == 0 else scaled_h - 1
+
+        scale_filter = f"scale={scaled_w}:{scaled_h}"
+        if filter_eq:
+            scale_filter = f"{filter_eq},{scale_filter}"
+        filter_parts.append(f"[0:v]{scale_filter},setsar=1[scaled]")
+
         filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}[bg]")
-        overlay_x = (REEL_WIDTH - content_width) // 2
-        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{video_top_margin}[canvas]")
-        
+
+        overlay_x = (REEL_WIDTH - scaled_w) // 2
+        overlay_y = image_top_margin + (content_height - scaled_h) // 2
+        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{overlay_y}[canvas]")
+
         current = "[canvas]"
-        
-        if top_text:
-            escaped = top_text.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
-            filter_parts.append(
-                f"{current}drawtext="
-                f"text='{escaped}':"
-                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
-                f"fontsize={text_font_size}:"
-                f"fontcolor={text_color}:"
-                f"x=(w-text_w)/2:"
-                f"y={text_y_position}:"
-                f"shadowcolor={shadow_color}:"
-                f"shadowx=2:shadowy=2"
-                f"[texted]"
-            )
+
+        # Add text
+        if top_text and text_lines:
+            start_y = 40
+
+            for i, line in enumerate(text_lines):
+                escaped_line = line.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+                line_y = start_y + (i * line_height)
+                out_label = f"[txt{i}]"
+                filter_parts.append(
+                    f"{current}drawtext="
+                    f"text='{escaped_line}':"
+                    f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+                    f"fontsize={text_font_size}:"
+                    f"fontcolor={text_color}:"
+                    f"x=(w-text_w)/2:"
+                    f"y={line_y}"
+                    f"{out_label}"
+                )
+                current = out_label
+
+            filter_parts.append(f"{current}null[texted]")
             current = "[texted]"
-        
+
+        # Watermark settings
+        wm_font_size = 32
+        wm_margin = 20
+        wm_opacity = 0.85
+
         if watermark_text:
             escaped_wm = watermark_text.replace("'", "'\\''").replace(":", "\\:")
-            wm_y = video_top_margin + wm_margin
+            wm_y = overlay_y + 15
             filter_parts.append(
                 f"{current}drawtext="
                 f"text='{escaped_wm}':"
-                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
                 f"fontsize={wm_font_size}:"
                 f"fontcolor=white@{wm_opacity}:"
                 f"x=w-tw-{wm_margin}:"
                 f"y={wm_y}:"
                 f"shadowcolor=black@0.5:"
-                f"shadowx=2:shadowy=2"
+                f"shadowx=1:shadowy=1"
                 f"[final]"
             )
         elif watermark_image and os.path.exists(watermark_image):
-            filter_parts.append(f"[1:v]scale=120:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
-            wm_y = video_top_margin + wm_margin
+            filter_parts.append(f"[1:v]scale=100:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
+            wm_y = overlay_y + 15
             filter_parts.append(f"{current}[wm]overlay=W-w-{wm_margin}:{wm_y}[final]")
         else:
             filter_parts.append(f"{current}null[final]")
@@ -847,9 +921,8 @@ async def receive_watermark_text(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def maybe_show_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if context.user_data.get('content_type') == 'image':
-        return await show_filter_options(update, context)
-    return await process_content(update, context)
+    # Show filters for both videos and images
+    return await show_filter_options(update, context)
 
 
 async def show_filter_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -897,7 +970,8 @@ async def process_content(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     top_text=context.user_data.get('top_text'),
                     watermark_text=context.user_data.get('watermark_text'),
                     watermark_image=context.user_data.get('watermark_image'),
-                    dark_mode=dark_mode
+                    dark_mode=dark_mode,
+                    filter_preset=context.user_data.get('filter_preset')
                 )
                 await status.edit_text("📤 Uploading...")
                 with open(output_path, 'rb') as f:
