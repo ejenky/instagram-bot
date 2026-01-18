@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  instagram-bot:
+    build: .
+    container_name: instagram-processor-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - DEFAULT_WATERMARK=${DEFAULT_WATERMARK:-@yourusername}
+      - WATERMARK_PATH=/app/assets/watermark.png
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+      - ./assets:/app/assets

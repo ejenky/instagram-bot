@@ -1,0 +1,774 @@
+"""
+Instagram Content Processor Telegram Bot - v2
+Styled like @clips, @lmaoys, @laxative viral formats
+"""
+
+import os
+import logging
+import asyncio
+import subprocess
+import tempfile
+import json
+import random
+import string
+from datetime import datetime
+from typing import Optional, Dict
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
+)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+WATERMARK_IMAGE_PATH = os.getenv('WATERMARK_PATH', '/app/assets/watermark.png')
+DEFAULT_WATERMARK_TEXT = os.getenv('DEFAULT_WATERMARK', '@yourusername')
+DATA_DIR = os.getenv('DATA_DIR', '/app/data')
+PRESETS_FILE = os.path.join(DATA_DIR, 'filter_presets.json')
+
+# Instagram Reels dimensions
+REEL_WIDTH = 1080
+REEL_HEIGHT = 1920
+
+# Conversation states
+(WAITING_FOR_CONTENT, CHOOSE_CROP, CHOOSE_MODE, ENTER_TEXT, CONFIRM_TEXT,
+ CHOOSE_WATERMARK, ENTER_WATERMARK_TEXT, CHOOSE_FILTER, 
+ MANAGE_PRESETS, CREATE_PRESET) = range(10)
+
+
+class PresetManager:
+    DEFAULT_PRESETS = {
+        "vibrant": {"name": "Vibrant", "description": "Boosted saturation and contrast", "filters": {"saturation": 1.4, "contrast": 1.2, "brightness": 1.05}},
+        "muted": {"name": "Muted", "description": "Subtle, desaturated look", "filters": {"saturation": 0.7, "contrast": 0.95, "brightness": 1.0}},
+        "warm": {"name": "Warm", "description": "Warm orange tones", "filters": {"saturation": 1.1, "contrast": 1.1, "brightness": 1.02, "temperature": 30}},
+        "cool": {"name": "Cool", "description": "Cool blue tones", "filters": {"saturation": 1.05, "contrast": 1.1, "brightness": 1.0, "temperature": -30}},
+        "high_contrast": {"name": "High Contrast", "description": "Punchy blacks and whites", "filters": {"saturation": 1.1, "contrast": 1.4, "brightness": 1.0}},
+        "faded": {"name": "Faded", "description": "Lifted blacks, vintage feel", "filters": {"saturation": 0.85, "contrast": 0.85, "brightness": 1.05, "black_point": 30}},
+        "none": {"name": "No Filter", "description": "Original image", "filters": {}}
+    }
+    
+    def __init__(self, presets_file: str):
+        self.presets_file = presets_file
+        self.presets = self._load_presets()
+    
+    def _load_presets(self) -> Dict:
+        presets = self.DEFAULT_PRESETS.copy()
+        if os.path.exists(self.presets_file):
+            try:
+                with open(self.presets_file, 'r') as f:
+                    presets.update(json.load(f))
+            except Exception as e:
+                logger.error(f"Error loading presets: {e}")
+        return presets
+    
+    def save_presets(self):
+        os.makedirs(os.path.dirname(self.presets_file), exist_ok=True)
+        custom = {k: v for k, v in self.presets.items() if k not in self.DEFAULT_PRESETS}
+        with open(self.presets_file, 'w') as f:
+            json.dump(custom, f, indent=2)
+    
+    def add_preset(self, key: str, name: str, description: str, filters: Dict):
+        self.presets[key] = {"name": name, "description": description, "filters": filters}
+        self.save_presets()
+    
+    def delete_preset(self, key: str) -> bool:
+        if key in self.DEFAULT_PRESETS:
+            return False
+        if key in self.presets:
+            del self.presets[key]
+            self.save_presets()
+            return True
+        return False
+    
+    def get_preset(self, key: str) -> Optional[Dict]:
+        return self.presets.get(key)
+    
+    def list_presets(self) -> Dict:
+        return self.presets
+
+
+class MediaProcessor:
+    def __init__(self, temp_dir: str, preset_manager: PresetManager):
+        self.temp_dir = temp_dir
+        self.preset_manager = preset_manager
+    
+    def _random_str(self, length: int = 8) -> str:
+        return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+    
+    async def download_video(self, url: str) -> str:
+        rand = self._random_str()
+        output_template = os.path.join(self.temp_dir, f'input_{rand}.%(ext)s')
+        cmd = ['yt-dlp', '--no-warnings', '-f', 'best[ext=mp4]/best', '--merge-output-format', 'mp4', '-o', output_template, '--no-playlist', '--no-check-certificates', url]
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise Exception(f"Download failed. Check the link is valid and public.")
+        for f in os.listdir(self.temp_dir):
+            if f.startswith(f'input_{rand}'):
+                return os.path.join(self.temp_dir, f)
+        raise Exception("Downloaded file not found")
+    
+    def get_media_info(self, path: str) -> Dict:
+        cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            info = json.loads(result.stdout)
+        except:
+            return {'width': 0, 'height': 0, 'duration': 0, 'is_video': False, 'has_audio': False}
+        video_stream = next((s for s in info.get('streams', []) if s['codec_type'] == 'video'), None)
+        audio_stream = next((s for s in info.get('streams', []) if s['codec_type'] == 'audio'), None)
+        if video_stream:
+            rotation = int(video_stream.get('tags', {}).get('rotate', 0))
+            w, h = int(video_stream.get('width', 0)), int(video_stream.get('height', 0))
+            if rotation in [90, 270]:
+                w, h = h, w
+            duration = float(info.get('format', {}).get('duration', 0))
+            return {'width': w, 'height': h, 'duration': duration, 'is_video': audio_stream is not None or duration > 0, 'has_audio': audio_stream is not None}
+        return {'width': 0, 'height': 0, 'duration': 0, 'is_video': False, 'has_audio': False}
+    
+    def _build_filter_eq(self, filters: Dict) -> Optional[str]:
+        parts = []
+        sat = filters.get('saturation', 1.0)
+        con = filters.get('contrast', 1.0)
+        bri = filters.get('brightness', 1.0)
+        if sat != 1.0 or con != 1.0 or bri != 1.0:
+            parts.append(f"eq=contrast={con}:brightness={bri-1.0}:saturation={sat}")
+        temp = filters.get('temperature', 0)
+        if temp != 0:
+            if temp > 0:
+                parts.append(f"colorbalance=rs={temp/100}:gs={temp/200}:bs=-{temp/100}")
+            else:
+                t = abs(temp)
+                parts.append(f"colorbalance=rs=-{t/100}:gs=-{t/200}:bs={t/100}")
+        bp = filters.get('black_point', 0)
+        if bp > 0:
+            parts.append(f"curves=m='0/{bp/255:.3f} 1/1'")
+        return ','.join(parts) if parts else None
+    
+    async def process_video(self, input_path: str, output_path: str, crop_mode: str = 'smart', 
+                           top_text: Optional[str] = None, watermark_text: Optional[str] = None, 
+                           watermark_image: Optional[str] = None, dark_mode: bool = True) -> str:
+        info = self.get_media_info(input_path)
+        src_w, src_h = info['width'], info['height']
+        if src_w == 0 or src_h == 0:
+            raise Exception("Could not read video dimensions")
+        
+        # Layout settings - VIRAL STYLE like @clips, @lmaoys
+        bg_color = "black" if dark_mode else "white"
+        text_color = "white" if dark_mode else "black"
+        shadow_color = "black@0.6" if dark_mode else "white@0.0"
+        
+        # Text settings - BIG and BOLD
+        text_font_size = 72
+        text_y_position = 220  # Higher up for multi-line text
+        
+        # Video area - starts after text, takes most of the screen
+        video_top_margin = 480 if top_text else 150
+        video_bottom_margin = 100
+        content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
+        content_width = REEL_WIDTH - 60  # Small side margins
+        
+        # Watermark settings - INSIDE video area, corner
+        wm_font_size = 36
+        wm_margin = 25
+        wm_opacity = 0.9
+        
+        filter_parts = []
+        
+        # Scale and crop video
+        src_aspect = src_w / src_h
+        target_aspect = content_width / content_height
+        
+        if crop_mode == 'fit':
+            if src_aspect > target_aspect:
+                scale_filter = f"scale={content_width}:-2"
+            else:
+                scale_filter = f"scale=-2:{content_height}"
+            filter_parts.append(f"[0:v]{scale_filter},setsar=1[scaled]")
+        else:
+            if src_aspect > target_aspect:
+                scale_h = content_height
+                scale_w = int(src_w * (content_height / src_h))
+            else:
+                scale_w = content_width
+                scale_h = int(src_h * (content_width / src_w))
+            crop_x = (scale_w - content_width) // 2
+            if crop_mode == 'top':
+                crop_y = 0
+            elif crop_mode == 'bottom':
+                crop_y = scale_h - content_height
+            else:
+                crop_y = (scale_h - content_height) // 2
+            filter_parts.append(f"[0:v]scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y},setsar=1[scaled]")
+        
+        # Background
+        filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}:d=1,format=yuv420p[bg]")
+        
+        # Overlay video centered
+        overlay_x = (REEL_WIDTH - content_width) // 2
+        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{video_top_margin}:shortest=0[canvas]")
+        
+        current = "[canvas]"
+        
+        # Add top text - VIRAL STYLE
+        if top_text:
+            # Handle multi-line text (split by newline or auto-wrap long text)
+            escaped = top_text.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+            filter_parts.append(
+                f"{current}drawtext="
+                f"text='{escaped}':"
+                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontsize={text_font_size}:"
+                f"fontcolor={text_color}:"
+                f"x=(w-text_w)/2:"
+                f"y={text_y_position}:"
+                f"shadowcolor={shadow_color}:"
+                f"shadowx=2:shadowy=2"
+                f"[texted]"
+            )
+            current = "[texted]"
+        
+        # Add watermark - INSIDE video area, top-right or top-left corner
+        if watermark_text:
+            escaped_wm = watermark_text.replace("'", "'\\''").replace(":", "\\:")
+            # Position watermark inside video area (top-right corner of video)
+            wm_x = REEL_WIDTH - wm_margin - 10  # Right side
+            wm_y = video_top_margin + wm_margin  # Just inside video top
+            filter_parts.append(
+                f"{current}drawtext="
+                f"text='{escaped_wm}':"
+                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontsize={wm_font_size}:"
+                f"fontcolor=white@{wm_opacity}:"
+                f"x=w-tw-{wm_margin}:"
+                f"y={wm_y}:"
+                f"shadowcolor=black@0.5:"
+                f"shadowx=2:shadowy=2"
+                f"[final]"
+            )
+        elif watermark_image and os.path.exists(watermark_image):
+            filter_parts.append(f"[1:v]scale=120:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
+            wm_y = video_top_margin + wm_margin
+            filter_parts.append(f"{current}[wm]overlay=W-w-{wm_margin}:{wm_y}[final]")
+        else:
+            filter_parts.append(f"{current}null[final]")
+        
+        filter_complex = ';'.join(filter_parts)
+        
+        # Determine if we need watermark image input
+        wm_input = []
+        if watermark_image and os.path.exists(watermark_image) and not watermark_text:
+            wm_input = ['-i', watermark_image]
+        
+        cmd = ['ffmpeg', '-y', '-i', input_path, *wm_input, '-filter_complex', filter_complex, '-map', '[final]']
+        if info.get('has_audio'):
+            cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
+        cmd.extend([
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+            '-map_metadata', '-1',
+            '-metadata', f'creation_time={datetime.utcnow().isoformat()}Z',
+            '-metadata', f'encoder=custom_{self._random_str(12)}',
+            '-metadata', f'comment={self._random_str(16)}',
+            '-fflags', '+genpts',
+            output_path
+        ])
+        
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.error(f"FFmpeg error: {stderr.decode()}")
+            raise Exception("Video processing failed")
+        return output_path
+    
+    async def process_image(self, input_path: str, output_path: str, crop_mode: str = 'smart',
+                           top_text: Optional[str] = None, watermark_text: Optional[str] = None,
+                           watermark_image: Optional[str] = None, filter_preset: Optional[str] = None,
+                           dark_mode: bool = True) -> str:
+        info = self.get_media_info(input_path)
+        src_w, src_h = info['width'], info['height']
+        if src_w == 0 or src_h == 0:
+            raise Exception("Could not read image dimensions")
+        
+        # Same layout as video
+        bg_color = "black" if dark_mode else "white"
+        text_color = "white" if dark_mode else "black"
+        shadow_color = "black@0.6" if dark_mode else "white@0.0"
+        
+        text_font_size = 72
+        text_y_position = 220
+        
+        video_top_margin = 480 if top_text else 150
+        video_bottom_margin = 100
+        content_height = REEL_HEIGHT - video_top_margin - video_bottom_margin
+        content_width = REEL_WIDTH - 60
+        
+        wm_font_size = 36
+        wm_margin = 25
+        wm_opacity = 0.9
+        
+        filter_parts = []
+        
+        # Apply filter preset if specified
+        preset_filter = None
+        if filter_preset and filter_preset != 'none':
+            preset = self.preset_manager.get_preset(filter_preset)
+            if preset:
+                preset_filter = self._build_filter_eq(preset.get('filters', {}))
+        
+        src_aspect = src_w / src_h
+        target_aspect = content_width / content_height
+        
+        if crop_mode == 'fit':
+            if src_aspect > target_aspect:
+                scale = f"scale={content_width}:-1"
+            else:
+                scale = f"scale=-1:{content_height}"
+            chain = f"{preset_filter},{scale}" if preset_filter else scale
+            filter_parts.append(f"[0:v]{chain},setsar=1[scaled]")
+        else:
+            if src_aspect > target_aspect:
+                scale_h = content_height
+                scale_w = int(src_w * (content_height / src_h))
+            else:
+                scale_w = content_width
+                scale_h = int(src_h * (content_width / src_w))
+            crop_x = (scale_w - content_width) // 2
+            crop_y = 0 if crop_mode == 'top' else (scale_h - content_height if crop_mode == 'bottom' else (scale_h - content_height) // 2)
+            chain = f"scale={scale_w}:{scale_h},crop={content_width}:{content_height}:{crop_x}:{crop_y}"
+            if preset_filter:
+                chain = f"{preset_filter},{chain}"
+            filter_parts.append(f"[0:v]{chain},setsar=1[scaled]")
+        
+        filter_parts.append(f"color={bg_color}:{REEL_WIDTH}x{REEL_HEIGHT}[bg]")
+        overlay_x = (REEL_WIDTH - content_width) // 2
+        filter_parts.append(f"[bg][scaled]overlay={overlay_x}:{video_top_margin}[canvas]")
+        
+        current = "[canvas]"
+        
+        if top_text:
+            escaped = top_text.replace("'", "'\\''").replace(":", "\\:").replace("\\", "\\\\")
+            filter_parts.append(
+                f"{current}drawtext="
+                f"text='{escaped}':"
+                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontsize={text_font_size}:"
+                f"fontcolor={text_color}:"
+                f"x=(w-text_w)/2:"
+                f"y={text_y_position}:"
+                f"shadowcolor={shadow_color}:"
+                f"shadowx=2:shadowy=2"
+                f"[texted]"
+            )
+            current = "[texted]"
+        
+        if watermark_text:
+            escaped_wm = watermark_text.replace("'", "'\\''").replace(":", "\\:")
+            wm_y = video_top_margin + wm_margin
+            filter_parts.append(
+                f"{current}drawtext="
+                f"text='{escaped_wm}':"
+                f"fontfile=/usr/share/fonts/truetype/inter/Inter-Bold.ttf:"
+                f"fontsize={wm_font_size}:"
+                f"fontcolor=white@{wm_opacity}:"
+                f"x=w-tw-{wm_margin}:"
+                f"y={wm_y}:"
+                f"shadowcolor=black@0.5:"
+                f"shadowx=2:shadowy=2"
+                f"[final]"
+            )
+        elif watermark_image and os.path.exists(watermark_image):
+            filter_parts.append(f"[1:v]scale=120:-1,format=yuva420p,colorchannelmixer=aa={wm_opacity}[wm]")
+            wm_y = video_top_margin + wm_margin
+            filter_parts.append(f"{current}[wm]overlay=W-w-{wm_margin}:{wm_y}[final]")
+        else:
+            filter_parts.append(f"{current}null[final]")
+        
+        filter_complex = ';'.join(filter_parts)
+        
+        wm_input = []
+        if watermark_image and os.path.exists(watermark_image) and not watermark_text:
+            wm_input = ['-i', watermark_image]
+        
+        cmd = ['ffmpeg', '-y', '-i', input_path, *wm_input, '-filter_complex', filter_complex, '-map', '[final]', '-q:v', '2',
+               '-map_metadata', '-1', '-metadata', f'comment={self._random_str(16)}', output_path]
+        
+        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.error(f"FFmpeg error: {stderr.decode()}")
+            raise Exception("Image processing failed")
+        return output_path
+
+
+os.makedirs(DATA_DIR, exist_ok=True)
+preset_manager = PresetManager(PRESETS_FILE)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "🎬 *Instagram Content Processor*\n\n"
+        "Send me:\n"
+        "• A video link (Twitter, TikTok, Instagram, YouTube)\n"
+        "• Or upload a video/image directly\n\n"
+        "I'll format it for Instagram Reels with:\n"
+        "✅ Fresh metadata (avoids duplicate flags)\n"
+        "✅ Custom cropping options\n"
+        "✅ Dark/Light mode\n"
+        "✅ Text overlay (viral style)\n"
+        "✅ Watermark\n"
+        "✅ Filter presets for images\n\n"
+        "*Commands:*\n"
+        "/presets - Manage filter presets\n"
+        "/settings - View settings\n"
+        "/cancel - Cancel operation",
+        parse_mode='Markdown'
+    )
+    return WAITING_FOR_CONTENT
+
+
+async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.message
+    if msg.text:
+        url = msg.text.strip()
+        domains = ['twitter.com', 'x.com', 'tiktok.com', 'instagram.com', 'youtube.com', 'youtu.be']
+        if any(d in url.lower() for d in domains):
+            context.user_data['url'] = url
+            context.user_data['content_type'] = 'video'
+            await msg.reply_text("⬇️ Downloading video...")
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    processor = MediaProcessor(temp_dir, preset_manager)
+                    input_path = await processor.download_video(url)
+                    persistent = os.path.join(DATA_DIR, f'input_{msg.from_user.id}.mp4')
+                    subprocess.run(['cp', input_path, persistent])
+                    context.user_data['input_path'] = persistent
+                    context.user_data['media_info'] = processor.get_media_info(persistent)
+                await msg.reply_text("✅ Downloaded!")
+                return await show_crop_options(update, context)
+            except Exception as e:
+                await msg.reply_text(f"❌ Download failed: {e}\n\nTry a different link.")
+                return WAITING_FOR_CONTENT
+        else:
+            await msg.reply_text("Send a valid link from Twitter/X, TikTok, Instagram, or YouTube.\nOr upload media directly.")
+            return WAITING_FOR_CONTENT
+    elif msg.photo:
+        photo = msg.photo[-1]
+        file = await photo.get_file()
+        path = os.path.join(DATA_DIR, f'input_{msg.from_user.id}.jpg')
+        await file.download_to_drive(path)
+        context.user_data['input_path'] = path
+        context.user_data['content_type'] = 'image'
+        await msg.reply_text("✅ Image received!")
+        return await show_crop_options(update, context)
+    elif msg.video or msg.document:
+        file = await (msg.video or msg.document).get_file()
+        ext = 'mp4'
+        if msg.document and msg.document.file_name:
+            ext = msg.document.file_name.split('.')[-1]
+        path = os.path.join(DATA_DIR, f'input_{msg.from_user.id}.{ext}')
+        await file.download_to_drive(path)
+        with tempfile.TemporaryDirectory() as td:
+            proc = MediaProcessor(td, preset_manager)
+            info = proc.get_media_info(path)
+        context.user_data['input_path'] = path
+        context.user_data['content_type'] = 'video' if info.get('is_video') else 'image'
+        context.user_data['media_info'] = info
+        await msg.reply_text(f"✅ {'Video' if info.get('is_video') else 'Image'} received!")
+        return await show_crop_options(update, context)
+    await msg.reply_text("Send a link, video, or image.")
+    return WAITING_FOR_CONTENT
+
+
+async def show_crop_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("🎯 Smart Crop", callback_data="crop_smart"), InlineKeyboardButton("⬛ Center", callback_data="crop_center")],
+        [InlineKeyboardButton("⬆️ Top", callback_data="crop_top"), InlineKeyboardButton("⬇️ Bottom", callback_data="crop_bottom")],
+        [InlineKeyboardButton("📐 Fit (Bars)", callback_data="crop_fit")],
+    ]
+    msg = update.message or update.callback_query.message
+    await msg.reply_text("📐 *How to crop?*\n\n• *Smart/Center*: Fill frame, centered\n• *Top/Bottom*: Keep top or bottom\n• *Fit*: Show all with bars", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return CHOOSE_CROP
+
+
+async def crop_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['crop_mode'] = query.data.replace("crop_", "")
+    
+    # Now ask for dark/light mode
+    keyboard = [
+        [InlineKeyboardButton("🌑 Dark Mode", callback_data="mode_dark")],
+        [InlineKeyboardButton("☀️ Light Mode", callback_data="mode_light")],
+    ]
+    await query.edit_message_text(
+        f"✅ Crop: *{context.user_data['crop_mode'].title()}*\n\n🎨 Choose background:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    return CHOOSE_MODE
+
+
+async def mode_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['dark_mode'] = query.data == "mode_dark"
+    mode_name = "Dark" if context.user_data['dark_mode'] else "Light"
+    
+    keyboard = [[InlineKeyboardButton("✍️ Add Text", callback_data="text_yes"), InlineKeyboardButton("⏭️ Skip", callback_data="text_no")]]
+    await query.edit_message_text(f"✅ Mode: *{mode_name}*\n\nAdd text above the content?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return ENTER_TEXT
+
+
+async def text_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "text_yes":
+        await query.edit_message_text("✍️ Enter the text to appear above:\n\n_Tip: Use short punchy text like the viral pages_", parse_mode='Markdown')
+        return CONFIRM_TEXT
+    context.user_data['top_text'] = None
+    return await show_watermark_options(update, context)
+
+
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['top_text'] = update.message.text.strip()
+    keyboard = [[InlineKeyboardButton("✅ Confirm", callback_data="text_confirm"), InlineKeyboardButton("✏️ Re-enter", callback_data="text_reenter")]]
+    await update.message.reply_text(f"📝 Preview:\n\n*{context.user_data['top_text']}*\n\nLook good?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return CONFIRM_TEXT
+
+
+async def text_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "text_reenter":
+        await query.edit_message_text("✍️ Enter the text again:")
+        return CONFIRM_TEXT
+    return await show_watermark_options(update, context)
+
+
+async def show_watermark_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton(f"📍 Default ({DEFAULT_WATERMARK_TEXT})", callback_data="wm_default")],
+        [InlineKeyboardButton("✍️ Custom Text", callback_data="wm_custom"), InlineKeyboardButton("🖼️ Image", callback_data="wm_image")],
+        [InlineKeyboardButton("⏭️ No Watermark", callback_data="wm_none")],
+    ]
+    query = update.callback_query
+    if query:
+        await query.edit_message_text("💧 *Watermark:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    else:
+        await update.message.reply_text("💧 *Watermark:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return CHOOSE_WATERMARK
+
+
+async def watermark_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "wm_default":
+        context.user_data['watermark_text'] = DEFAULT_WATERMARK_TEXT
+        context.user_data['watermark_image'] = None
+    elif query.data == "wm_custom":
+        await query.edit_message_text("✍️ Enter watermark text (e.g. @yourusername):")
+        return ENTER_WATERMARK_TEXT
+    elif query.data == "wm_image":
+        if os.path.exists(WATERMARK_IMAGE_PATH):
+            context.user_data['watermark_text'] = None
+            context.user_data['watermark_image'] = WATERMARK_IMAGE_PATH
+        else:
+            await query.edit_message_text("❌ No watermark image set. Set WATERMARK_PATH env var.")
+            return await show_watermark_options(update, context)
+    else:
+        context.user_data['watermark_text'] = None
+        context.user_data['watermark_image'] = None
+    return await maybe_show_filters(update, context)
+
+
+async def receive_watermark_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['watermark_text'] = update.message.text.strip()
+    context.user_data['watermark_image'] = None
+    return await maybe_show_filters(update, context)
+
+
+async def maybe_show_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if context.user_data.get('content_type') == 'image':
+        return await show_filter_options(update, context)
+    return await process_content(update, context)
+
+
+async def show_filter_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    presets = preset_manager.list_presets()
+    keyboard = []
+    row = []
+    for key, preset in presets.items():
+        row.append(InlineKeyboardButton(preset['name'], callback_data=f"filter_{key}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    msg = update.callback_query.message if update.callback_query else update.message
+    await msg.reply_text("🎨 *Choose filter:*", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return CHOOSE_FILTER
+
+
+async def filter_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['filter_preset'] = query.data.replace("filter_", "")
+    preset = preset_manager.get_preset(context.user_data['filter_preset'])
+    await query.edit_message_text(f"✅ Filter: *{preset['name'] if preset else 'None'}*", parse_mode='Markdown')
+    return await process_content(update, context)
+
+
+async def process_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.callback_query.message if update.callback_query else update.message
+    status = await msg.reply_text("⚙️ Processing...")
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            processor = MediaProcessor(temp_dir, preset_manager)
+            input_path = context.user_data['input_path']
+            content_type = context.user_data['content_type']
+            dark_mode = context.user_data.get('dark_mode', True)
+            rand = processor._random_str()
+            ext = 'mp4' if content_type == 'video' else 'jpg'
+            output_path = os.path.join(temp_dir, f'output_{rand}.{ext}')
+            if content_type == 'video':
+                await status.edit_text("⚙️ Processing video...\n🎬 Applying viral format...")
+                await processor.process_video(
+                    input_path, output_path,
+                    crop_mode=context.user_data.get('crop_mode', 'smart'),
+                    top_text=context.user_data.get('top_text'),
+                    watermark_text=context.user_data.get('watermark_text'),
+                    watermark_image=context.user_data.get('watermark_image'),
+                    dark_mode=dark_mode
+                )
+                await status.edit_text("📤 Uploading...")
+                with open(output_path, 'rb') as f:
+                    await msg.reply_video(video=f, caption="✅ Done!\n📱 Ready for Reels\n🔄 Fresh metadata", supports_streaming=True)
+            else:
+                await status.edit_text("⚙️ Processing image...\n🖼️ Applying viral format...")
+                await processor.process_image(
+                    input_path, output_path,
+                    crop_mode=context.user_data.get('crop_mode', 'smart'),
+                    top_text=context.user_data.get('top_text'),
+                    watermark_text=context.user_data.get('watermark_text'),
+                    watermark_image=context.user_data.get('watermark_image'),
+                    filter_preset=context.user_data.get('filter_preset'),
+                    dark_mode=dark_mode
+                )
+                await status.edit_text("📤 Uploading...")
+                with open(output_path, 'rb') as f:
+                    await msg.reply_photo(photo=f, caption="✅ Done!\n📱 Ready for Instagram\n🔄 Fresh metadata")
+        await status.delete()
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        context.user_data.clear()
+        await msg.reply_text("🎉 Send another link or file!")
+        return WAITING_FOR_CONTENT
+    except Exception as e:
+        logger.error(f"Processing error: {e}", exc_info=True)
+        await status.edit_text(f"❌ Failed: {e}")
+        context.user_data.clear()
+        return WAITING_FOR_CONTENT
+
+
+async def manage_presets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    presets = preset_manager.list_presets()
+    preset_list = "\n".join([f"• *{p['name']}*: {p['description']}" for p in presets.values()])
+    keyboard = [[InlineKeyboardButton("➕ Create Preset", callback_data="preset_create")], [InlineKeyboardButton("🗑️ Delete Preset", callback_data="preset_delete")], [InlineKeyboardButton("🔙 Back", callback_data="preset_back")]]
+    await update.message.reply_text(f"🎨 *Filter Presets*\n\n{preset_list}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return MANAGE_PRESETS
+
+
+async def preset_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "preset_back":
+        await query.edit_message_text("Send a link or file to process!")
+        return WAITING_FOR_CONTENT
+    elif query.data == "preset_create":
+        await query.edit_message_text("🆕 *Create Preset*\n\nSend in format:\n\n`name: My Filter`\n`description: Cool look`\n`saturation: 1.2`\n`contrast: 1.1`\n`brightness: 1.0`\n`temperature: 20`\n\n_Values are multipliers (1.0 = normal)_", parse_mode='Markdown')
+        return CREATE_PRESET
+    elif query.data == "preset_delete":
+        custom = {k: v for k, v in preset_manager.list_presets().items() if k not in PresetManager.DEFAULT_PRESETS}
+        if not custom:
+            await query.edit_message_text("No custom presets to delete.")
+            return WAITING_FOR_CONTENT
+        keyboard = [[InlineKeyboardButton(f"🗑️ {p['name']}", callback_data=f"delete_{k}")] for k, p in custom.items()]
+        keyboard.append([InlineKeyboardButton("🔙 Cancel", callback_data="preset_back")])
+        await query.edit_message_text("Select preset to delete:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return MANAGE_PRESETS
+    elif query.data.startswith("delete_"):
+        key = query.data.replace("delete_", "")
+        preset_manager.delete_preset(key)
+        await query.edit_message_text("✅ Deleted!")
+        return WAITING_FOR_CONTENT
+    return MANAGE_PRESETS
+
+
+async def create_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        lines = update.message.text.strip().split('\n')
+        config = {}
+        for line in lines:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                config[k.strip().lower()] = v.strip()
+        name = config.get('name', 'Custom')
+        desc = config.get('description', 'Custom filter')
+        filters = {}
+        for k in ['saturation', 'contrast', 'brightness']:
+            if k in config:
+                filters[k] = float(config[k])
+        if 'temperature' in config:
+            filters['temperature'] = int(config['temperature'])
+        key = ''.join(c for c in name.lower().replace(' ', '_') if c.isalnum() or c == '_')
+        preset_manager.add_preset(key, name, desc, filters)
+        await update.message.reply_text(f"✅ Created '*{name}*'!\n\nSend content to try it.", parse_mode='Markdown')
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+    return WAITING_FOR_CONTENT
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled. Send new content to start.")
+    return WAITING_FOR_CONTENT
+
+
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(f"⚙️ *Settings*\n\n📐 Output: {REEL_WIDTH}x{REEL_HEIGHT}\n💧 Default watermark: `{DEFAULT_WATERMARK_TEXT}`\n🖼️ Watermark image: {'✅' if os.path.exists(WATERMARK_IMAGE_PATH) else '❌'}", parse_mode='Markdown')
+
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_content)],
+        states={
+            WAITING_FOR_CONTENT: [MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_content)],
+            CHOOSE_CROP: [CallbackQueryHandler(crop_selected, pattern="^crop_")],
+            CHOOSE_MODE: [CallbackQueryHandler(mode_selected, pattern="^mode_")],
+            ENTER_TEXT: [CallbackQueryHandler(text_choice, pattern="^text_")],
+            CONFIRM_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text), CallbackQueryHandler(text_confirmed, pattern="^text_")],
+            CHOOSE_WATERMARK: [CallbackQueryHandler(watermark_selected, pattern="^wm_")],
+            ENTER_WATERMARK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_watermark_text)],
+            CHOOSE_FILTER: [CallbackQueryHandler(filter_selected, pattern="^filter_")],
+            MANAGE_PRESETS: [CallbackQueryHandler(preset_action)],
+            CREATE_PRESET: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_preset)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+    )
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("presets", manage_presets))
+    app.add_handler(CommandHandler("settings", settings))
+    print("🤖 Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
